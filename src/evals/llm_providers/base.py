@@ -1,14 +1,11 @@
 """Agent client interface protocol for AI providers.
 
 Defines the contract that all AI agent implementations must follow (Claude Agent SDK,
-Copilot SDK, future providers, etc.). Uses Python's Protocol for structural typing —
-any class implementing these methods is a valid AgentClient, no inheritance needed.
+Copilot SDK, future providers, etc.). Uses Python's Protocol for structural typing, no inheritance needed.
 
 This enables:
   - Easy addition of new providers without changing evals core logic
   - Testability via mock implementations (no ABC required)
-  - Future extensibility (streaming, RAG indexing, etc.)
-  - Natural duck typing (if it implements the methods, it's an AgentClient)
 
 Current implementations:
   - agent_client.py (Claude Agent SDK + local `claude -p` CLI)
