@@ -10,11 +10,8 @@ Each verdict represents one relationship:
 
 Strict one-to-one matching: each finding maps to at most one golden comment, and
 each golden maps to at most one finding. Multiple findings claiming the same golden
-(or vice versa) silently keeps only the first pair.
-
-BUG FIX (BUG-5): Previously, duplicate matches were silently skipped without
-logging, causing silent data loss. Now: all duplicate matches are logged so
-operators can investigate why the judge produced conflicting verdicts.
+(or vice versa) silently keeps only the first pair. All duplicate matches are
+logged so we can investigate why the judge produced conflicting verdicts.
 """
 
 from __future__ import annotations

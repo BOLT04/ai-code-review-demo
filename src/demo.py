@@ -41,7 +41,7 @@ async def main():
         # 1 Run agents
         findings = await review_pull_request(pr, mode="full", transcript_dir=transcript_dir)
 
-        # 2 Grader: LLM-as-judge (model-based grader)
+        # 2 Grader: LLM-as-a-judge (model-based grader)
         verdicts = await judge_pr(pr, findings)
 
         # 3 Scores and outcomes: precision, recall, F1, severity_accuracy, etc
