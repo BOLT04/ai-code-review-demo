@@ -32,6 +32,10 @@ GitHub Copilot's built-in code review already handles a lot of the noise, like s
 ### Slides
 The slides for the talk are in [slides/genai-meetup-2026-practical-workflows-ai-code-review.pdf](slides/genai-meetup-2026-practical-workflows-ai-code-review.pdf). This was for the [GenAI Lisbon meetup 2026](https://www.meetup.com/lisbon-genai-community/events/315381061/).
 
+### Talk recording
+
+- [GenAI Lisbon meetup 2026](https://www.youtube.com/watch?v=E3lXaXTMxpM)
+
 ### Duration
 25min - 45min
 
