@@ -7,13 +7,13 @@
   },
   "scripts": {
     "review": "node src/review.ts",
-    "test": "node --test test/*.test.ts",
+    "test": "node --test tests/*.test.ts",
     "check:updates": "npm outdated",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@github/copilot-sdk": "1.0.28",
-    "@octokit/rest": "22.0.1"
+    "@github/copilot-sdk": "^1.0.28",
+    "@octokit/rest": "^22.0.1"
   },
   "overrides": {
     "@github/copilot-sdk": {
@@ -21,7 +21,7 @@
     }
   },
   "devDependencies": {
-    "@types/node": "26.6.5",
-    "typescript": "7.0.2"
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
   }
 }

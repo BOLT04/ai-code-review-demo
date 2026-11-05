@@ -45,7 +45,7 @@ function findingMarkdown(finding: Finding): string {
   return `${where}${agent}\n\n${finding.body}`;
 }
 
-export function findingCommentBody(finding: Finding, runtimeEvidence: RuntimeApiEvidence[]): string {
+function findingCommentBody(finding: Finding, runtimeEvidence: RuntimeApiEvidence[]): string {
   const body = finding.body;
   const relevantEvidence = runtimeEvidence.filter((evidence) => {
     const path = new URL(evidence.request.url).pathname;

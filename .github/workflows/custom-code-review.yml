@@ -1,0 +1,199 @@
+name: SDK Custom Code Review
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  authorize:
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/cool-review') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    outputs:
+      run: ${{ steps.pr.outputs.run }}
+      model: ${{ steps.pr.outputs.model }}
+      reviewers: ${{ steps.pr.outputs.reviewers }}
+      same_repo: ${{ steps.pr.outputs.same_repo }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      evidence: ${{ steps.pr.outputs.evidence }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: src/copilot-review
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install review script dependencies
+        working-directory: src/copilot-review
+        run: npm ci --no-audit --no-fund
+
+      - name: Type check
+        working-directory: src/copilot-review
+        run: npm run typecheck
+
+      - name: Authorize command and resolve PR source
+        id: pr
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { pathToFileURL } = require("node:url");
+            const { resolveReviewRequest } = await import(pathToFileURL(
+              `${process.env.GITHUB_WORKSPACE}/src/copilot-review/src/integrations/github/review-request.ts`
+            ).href);
+            await resolveReviewRequest({ github, context, core });
+
+  review:
+    needs: authorize
+    if: needs.authorize.outputs.run == 'true'
+    # A newer authorized command for the same PR replaces the running review.
+    concurrency:
+      group: copilot-review-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    env:
+      RUNTIME_CONTAINER_NAME: runtime-api-review-${{ github.run_id }}-${{ github.run_attempt }}
+      RUNTIME_API_PORT: "3010"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install review script dependencies
+        working-directory: src/copilot-review
+        run: npm ci --no-audit --no-fund
+
+      # Same-repository PR code is built without install scripts and run only in the constrained runtime container
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.authorize.outputs.same_repo == 'true'
+        with:
+          ref: ${{ needs.authorize.outputs.head_sha }}
+          path: pr
+          persist-credentials: false
+
+      - name: Start runtime-evidence service
+        id: evidence
+        if: needs.authorize.outputs.evidence == 'true'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          echo "Runtime-evidence startup configuration: container=$RUNTIME_CONTAINER_NAME"
+          trap 'status=$?; echo "::warning::Runtime-evidence startup failed at line ${LINENO} (exit ${status}); continuing without runtime API evidence."; exit "$status"' ERR
+          docker build \
+            --file "$GITHUB_WORKSPACE/src/js-codebase/Dockerfile" \
+            --tag review-demo-api:pr \
+            "$GITHUB_WORKSPACE/pr/src/js-codebase"
+          echo "PR service image build passed using the trusted Dockerfile."
+          docker run --detach \
+            --name "$RUNTIME_CONTAINER_NAME" \
+            --publish "127.0.0.1:${RUNTIME_API_PORT}:${RUNTIME_API_PORT}" \
+            --env "PORT=${RUNTIME_API_PORT}" \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+            --security-opt no-new-privileges:true \
+            --cap-drop ALL \
+            --pids-limit 32 \
+            --memory 64m \
+            --cpus 0.5 \
+            --init \
+            review-demo-api:pr
+          ready=false
+          for attempt in $(seq 1 60); do
+            if bash -c 'exec 3<>/dev/tcp/127.0.0.1/'"$RUNTIME_API_PORT" 2>/dev/null; then
+              ready=true
+              break
+            fi
+            if [[ "$(docker inspect --format '{{.State.Running}}' "$RUNTIME_CONTAINER_NAME")" != "true" ]]; then
+              echo "::error::PR service container exited before becoming healthy."
+              exit 1
+            fi
+            sleep 2
+          done
+          if [[ "$ready" != "true" ]]; then
+            echo "::error::PR service did not listen on port ${RUNTIME_API_PORT} within 120 seconds."
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "PR service is listening in the constrained runtime container; runtime evidence is enabled."
+
+      - name: Run Copilot review
+        working-directory: src/copilot-review
+        shell: bash
+        run: |
+          if [[ -n "$REVIEWERS" ]]; then
+            read -r -a reviewer_args <<< "$REVIEWERS"
+            printf -v formatted_reviewers '%q ' "${reviewer_args[@]}"
+          else
+            reviewer_args=()
+            formatted_reviewers="<none; all specialists>"
+          fi
+          echo "Workflow configuration: RUNTIME_CONTAINER_NAME=$RUNTIME_CONTAINER_NAME"
+          echo "Review invocation configuration: COPILOT_MODEL=$COPILOT_MODEL ENABLE_RUNTIME_API_EVIDENCE=$ENABLE_RUNTIME_API_EVIDENCE RUNTIME_API_URL=$RUNTIME_API_URL PR_NUMBER=$PR_NUMBER REVIEW_HEAD_SHA=$REVIEW_HEAD_SHA PR_DIR=$PR_DIR MAX_DIFF_CHARS=$MAX_DIFF_CHARS REVIEW_TIMEOUT_MS=$REVIEW_TIMEOUT_MS REVIEW_MAX_429_RETRIES=$REVIEW_MAX_429_RETRIES MAX_AI_CREDITS=$MAX_AI_CREDITS"
+          echo "Review CLI arguments: $formatted_reviewers"
+          if [[ -n "$REVIEWERS" ]]; then
+            npm run review -- "${reviewer_args[@]}"
+          else
+            npm run review
+          fi
+        env:
+          REVIEWERS: ${{ needs.authorize.outputs.reviewers }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          PR_DIR: ${{ github.workspace }}/pr
+          REVIEW_HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          ENABLE_RUNTIME_API_EVIDENCE: ${{ steps.evidence.outputs.enabled == 'true' && 'true' || 'false' }}
+          RUNTIME_API_URL: http://127.0.0.1:${{ env.RUNTIME_API_PORT }}
+
+          # Copilot subscription: user's fine-grained PAT, with the "Copilot Requests" account permission.
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+
+          # BYOK takes precedence when the BYOK_BASE_URL secret is set
+          # (e.g. Azure OpenAI v1: https://<resource>.openai.azure.com/openai/v1).
+          #BYOK_BASE_URL: ${{ secrets.BYOK_BASE_URL }}
+          #BYOK_API_KEY: ${{ secrets.BYOK_BASE_URL && secrets.BYOK_API_KEY || '' }}
+          #BYOK_MODEL: ${{ secrets.BYOK_BASE_URL && (needs.authorize.outputs.model || vars.BYOK_MODEL || 'gpt-5-mini') || '' }}
+          #BYOK_PROVIDER_TYPE: ${{ secrets.BYOK_BASE_URL && vars.BYOK_PROVIDER_TYPE || '' }}  # openai (default) | azure | anthropic
+          #BYOK_WIRE_API: ${{ secrets.BYOK_BASE_URL && vars.BYOK_WIRE_API || '' }}  # openai/azure: responses (default) | completions
+
+          # Optional
+          COPILOT_MODEL: ${{ needs.authorize.outputs.model || vars.COPILOT_MODEL || 'gpt-6-luna' }}
+          MAX_DIFF_CHARS: ${{ vars.MAX_DIFF_CHARS }}
+          REVIEW_TIMEOUT_MS: ${{ vars.REVIEW_TIMEOUT_MS || '1500000' }}
+          #REVIEW_MAX_429_RETRIES: ${{ vars.REVIEW_MAX_429_RETRIES || '9' }}
+          # Premium models (e.g. claude-opus-5.5) exceed a low amount usually, e.g. our 30-credit default.
+          MAX_AI_CREDITS: ${{ vars.MAX_AI_CREDITS || '200' }}
+
+      - name: Print runtime-api service diagnostics
+        if: ${{ always() && needs.authorize.outputs.evidence == 'true' }}
+        shell: bash
+        run: |
+          docker ps -a --filter "name=^/${RUNTIME_CONTAINER_NAME}$" || true
+          echo "::group::PR service container logs (last 200 lines)"
+          marker="$(cat /proc/sys/kernel/random/uuid)"
+          echo "::stop-commands::$marker"
+          docker logs --timestamps --tail=200 "$RUNTIME_CONTAINER_NAME" || true
+          echo "::$marker::"
+          echo "::endgroup::"
+
+      - name: Clean up runtime-api service
+        if: ${{ always() && needs.authorize.outputs.evidence == 'true' }}
+        run: docker rm --force "$RUNTIME_CONTAINER_NAME" || true

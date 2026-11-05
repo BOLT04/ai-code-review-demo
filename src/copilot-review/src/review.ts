@@ -1,78 +1,192 @@
-import { readFile, stat, writeFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+import { accessSync, constants, statSync } from "node:fs";
+import { Octokit } from "@octokit/rest";
 import { ConfigError, env, resolveReviewConfiguration } from "./config/configuration.ts";
+import { parseRuntimeApiBaseUrl } from "./application/runtime-api-check.ts";
 import { commentableLines, filterDiffByPathPrefix, isPlaceable } from "./application/findings.ts";
 import { runReviewPipeline } from "./application/review-pipeline.ts";
 import { parseReviewerSelection, ReviewSelectionError } from "./application/review-selection.ts";
+import type { ReviewResult } from "./application/types.ts";
 import { CopilotReviewRunner } from "./integrations/copilot/copilot-runner.ts";
-import { buildReviewBody } from "./integrations/github/github.ts";
+import { buildReviewBody, submitReview } from "./integrations/github/github.ts";
 import { loadArchitectureDocuments } from "./integrations/architecture-context.ts";
-import { parseReviewInput, buildPublication } from "./application/static-review.ts";
 
-const SECRET_ENV = ["COPILOT_GITHUB_TOKEN", "BYOK_API_KEY"];
+const MENTION_PATTERN = /@(?=[A-Za-z0-9])/g;
+const SECRET_ENV = ["COPILOT_GITHUB_TOKEN", "BYOK_API_KEY", "GITHUB_TOKEN"];
+const REVIEWED_PATH_PREFIX = "src/js-codebase/";
+let notificationContext: { octokit: Octokit; owner: string; repo: string; pullNumber: number } | undefined;
+let reviewCost = "cost unavailable (review session did not start)";
 
 function sanitize(text: string): string {
   const secrets = SECRET_ENV.map(env).filter((value): value is string => value !== undefined);
+  // Keep replacement code byte-for-byte intact; never publish redacted code as an apply-able fix.
   const parts = text.split(/(^```suggestion[ \t]*\r?\n[\s\S]*?^```[ \t]*(?=\r?$))/gm);
   return parts.map((part, index) => {
     if (index % 2 === 1) {
       return secrets.some((secret) => part.includes(secret))
-        ? "[Suggestion omitted because it contains a configured secret.]" : part;
+        ? "[Suggestion omitted because it contains a configured secret.]"
+        : part;
     }
-    for (const secret of secrets) part = part.split(secret).join("[REDACTED]");
-    return part.replace(/@(?=[A-Za-z0-9])/g, "@\u200b");
+    let prose = part;
+    for (const secret of secrets) {
+      prose = prose.split(secret).join("[REDACTED]");
+    }
+    return prose.replace(MENTION_PATTERN, "@\u200b");
   }).join("");
 }
 
-async function main(): Promise<void> {
-  const selectedReviewers = parseReviewerSelection(process.argv.slice(2));
-  const config = resolveReviewConfiguration();
-  const inputStat = await stat(config.inputPath);
-  if (!inputStat.isFile() || inputStat.size > 2_000_000) {
-    throw new ConfigError("Review input must be a JSON file no larger than 2 MB.");
-  }
-  const input = parseReviewInput(JSON.parse(await readFile(config.inputPath, "utf8")), config.reviewHeadSha);
-  const trustedRoot = fileURLToPath(new URL("../../../", import.meta.url));
-  const architectureDocuments = !selectedReviewers || selectedReviewers.includes("architecture-reviewer")
-    ? await loadArchitectureDocuments(trustedRoot) : [];
-  const scopedDiff = filterDiffByPathPrefix(input.diff, "src/js-codebase/");
-  const truncated = scopedDiff.length > config.maxDiffChars;
-  const diff = truncated ? scopedDiff.slice(0, config.maxDiffChars) : scopedDiff;
-  const commentable = commentableLines(diff);
-  console.log(`Diff review: commit ${input.headSha}; diff truncated=${truncated}; runtime evidence=${Boolean(config.runtimeApiUrl)}; no agent filesystem tools.`);
-  const runner = await CopilotReviewRunner.start({
-    ...(config.auth.model ? { model: config.auth.model } : {}),
-    ...(config.auth.provider ? { provider: config.auth.provider } : {}),
-    architectureDocuments,
-    maxAiCredits: config.maxAiCredits,
-    max429Retries: config.max429Retries,
-    runtimeApiUrl: config.runtimeApiUrl,
-    log: (message) => console.log(sanitize(message)),
-    warn: (message) => console.warn(sanitize(message)),
-    sanitize,
-  });
+function safeEndpoint(baseUrl: string | undefined): string | undefined {
+  if (!baseUrl) return undefined;
   try {
-    const result = await runReviewPipeline({
-      title: input.title, body: input.body, diff, truncated, architectureDocuments,
-    }, runner, Math.max(1, Math.floor(config.timeoutMs / 2)), selectedReviewers);
-    const cost = await runner.readCost();
-    const meta = `Auth: ${config.auth.mode}${config.auth.model ? ` · model: ${config.auth.model}` : ""} · ${cost} · commit ${input.headSha.slice(0, 7)} · ${config.runtimeApiUrl ? "diff review with runtime evidence" : "static diff-only review"}`;
-    const unplaced = result.findings.filter((finding) => !isPlaceable(finding, commentable));
-    const output = buildPublication(
-      result,
-      (inline) => buildReviewBody(result, meta, inline ? unplaced : result.findings),
-      commentable,
-      sanitize,
-    );
-    await writeFile(config.outputPath, JSON.stringify(output), { flag: "wx", mode: 0o600 });
-    console.log(`Review generated (${result.findings.length} findings); publication is a separate trusted step.`);
-  } finally {
-    await runner.close();
+    const url = new URL(baseUrl);
+    return `${url.protocol}//${url.host}${url.pathname}`;
+  } catch {
+    return "[invalid URL omitted]";
   }
 }
 
-main().catch((error: unknown) => {
+/**
+ * Integration entry point: fetch trusted PR metadata and diff, invoke the
+ * provider-neutral policy pipeline through the Copilot adapter, then publish
+ * only its validated result through the GitHub adapter.
+ */
+async function main(): Promise<void> {
+  const selectedReviewers = parseReviewerSelection(process.argv.slice(2));
+  const config = resolveReviewConfiguration();
+  const {
+    auth, owner, repo, pullNumber, maxDiffChars, timeoutMs,
+    runtimeApiEvidenceEnabled, runtimeApiUrl,
+    maxAiCredits: reviewMaxAiCredits, max429Retries: reviewMax429Retries,
+  } = config;
+  const stageTimeoutMs = Math.max(1, Math.floor(timeoutMs / 2));
+  if (runtimeApiUrl) {
+    try {
+      parseRuntimeApiBaseUrl(runtimeApiUrl);
+    } catch {
+      throw new ConfigError("`RUNTIME_API_URL` must be a credential-free loopback HTTP origin (http://127.0.0.1:port).");
+    }
+  }
+  let prDir: string;
+  try {
+    prDir = config.prDir ?? execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    if (!statSync(prDir).isDirectory()) {
+      throw new ConfigError("`PR_DIR` must point to a readable checkout directory.");
+    }
+    accessSync(prDir, constants.R_OK | constants.X_OK);
+  } catch (error) {
+    if (error instanceof ConfigError) throw error;
+    throw new ConfigError("Set `PR_DIR` to an existing checkout directory, or run the review inside a Git repository.");
+  }
+  const octokit = new Octokit({ auth: config.githubToken });
+  notificationContext = { octokit, owner, repo, pullNumber };
+  const configForLog = {
+    authMode: auth.mode,
+    provider: auth.provider?.type ?? "copilot",
+    model: auth.model ?? "SDK default",
+    baseUrl: safeEndpoint(auth.provider?.baseUrl),
+    wireApi: auth.provider?.wireApi,
+    apiKeyConfigured: Boolean(auth.provider?.apiKey),
+    maxAiCredits: reviewMaxAiCredits,
+    max429Retries: reviewMax429Retries,
+    runtimeApiUrl: safeEndpoint(runtimeApiUrl),
+    maxDiffChars,
+    reviewTimeoutMs: timeoutMs,
+    stageTimeoutMs,
+    selectedReviewers: selectedReviewers ?? "all",
+  };
+  console.log(`Review configuration (secrets omitted):\n${sanitize(JSON.stringify(configForLog, null, 2))}`);
+
+  const { data: pr } = await octokit.pulls.get({ owner, repo, pull_number: pullNumber });
+  if (pr.head.repo?.full_name !== `${owner}/${repo}`) {
+    throw new ConfigError("PRs from forks are not supported (the review runs with repository secrets).");
+  }
+  if (config.reviewHeadSha && config.reviewHeadSha !== pr.head.sha) {
+    throw new ConfigError("The PR head changed after checkout; rerun the review for the current commit.");
+  }
+
+  const architectureDocuments = !selectedReviewers || selectedReviewers.includes("architecture-reviewer")
+    ? await loadArchitectureDocuments(prDir)
+    : [];
+
+  const diffResponse = await octokit.pulls.get({ owner, repo, pull_number: pullNumber, mediaType: { format: "diff" } });
+  const fullDiff = diffResponse.data as unknown as string;
+  const scopedDiff = filterDiffByPathPrefix(fullDiff, REVIEWED_PATH_PREFIX);
+  const commentable = commentableLines(scopedDiff);
+  const truncated = scopedDiff.length > maxDiffChars;
+  const diff = truncated ? scopedDiff.slice(0, maxDiffChars) : scopedDiff;
+
+  const runner = await CopilotReviewRunner.start({
+    ...(auth.model ? { model: auth.model } : {}),
+    ...(auth.provider ? { provider: auth.provider } : {}),
+    ...(auth.gitHubToken ? { gitHubToken: auth.gitHubToken } : {}),
+    workingDirectory: prDir,
+    architectureDocuments,
+    maxAiCredits: reviewMaxAiCredits,
+    max429Retries: reviewMax429Retries,
+    runtimeApiUrl,
+    log: (message) => console.log(message),
+    warn: (message) => console.warn(message),
+    sanitize,
+  });
+  reviewCost = "cost unavailable (SDK did not report billing usage)";
+
+  let result: ReviewResult;
+  try {
+    result = await runReviewPipeline({
+      title: pr.title,
+      body: pr.body ?? "",
+      diff,
+      truncated,
+      architectureDocuments,
+    }, runner, stageTimeoutMs, selectedReviewers);
+  } finally {
+    reviewCost = await runner.readCost();
+    console.log(`Review usage: ${reviewCost}`);
+    await runner.close();
+  }
+
+  console.log(sanitize(`[runtime-api] review-evidence\n${JSON.stringify({
+    enabled: runner.runtimeApiCheckEnabled,
+    captured: runner.getRuntimeApiEvidence().length > 0,
+    requests: runner.getRuntimeApiEvidence().map((evidence) => ({
+      method: evidence.request.method,
+      url: evidence.request.url,
+      status: evidence.response?.status ?? null,
+    })),
+  }, null, 2)}`));
+  const meta = `Auth: ${auth.mode}${auth.model ? ` · model: ${auth.model}` : ""} · ${reviewCost} · commit ${pr.head.sha.slice(0, 7)}`;
+  const unplaced = result.findings.filter((finding) => !isPlaceable(finding, commentable));
+  await submitReview(
+    octokit,
+    owner,
+    repo,
+    pullNumber,
+    sanitize,
+    result.findings.some((finding) => finding.severity === "critical") ? "REQUEST_CHANGES" : "COMMENT",
+    (inline) => buildReviewBody(result, meta, inline ? unplaced : result.findings),
+    result.findings,
+    commentable,
+    result.runtimeEvidence ?? [],
+  );
+  console.log(`Review submitted (${result.findings.length} findings).`);
+}
+
+main().catch(async (error: unknown) => {
+  console.error(error instanceof ConfigError ? sanitize(`Configuration error: ${error.message}`) : error);
+  if (error instanceof ReviewSelectionError) {
+    console.error("Usage: npm run review [-- <reviewer-name> [<reviewer-name>]]");
+    process.exitCode = 2;
+    return;
+  }
+  process.exitCode = 1;
+  if (!notificationContext) return;
+  const { octokit, owner, repo, pullNumber } = notificationContext;
   const message = error instanceof Error ? error.message : String(error);
-  console.error(sanitize(`Review failed: ${message}`));
-  process.exitCode = error instanceof ReviewSelectionError ? 2 : 1;
+  const hint = error instanceof ConfigError ? error.message : `The review failed: ${message}\n\nIf you are using a Copilot subscription, check that the token owner has an active Copilot subscription and the token has the **Copilot Requests** permission. Otherwise check your BYOK settings.`;
+  try {
+    await submitReview(octokit, owner, repo, pullNumber, sanitize, "COMMENT", () => `## 🤖 Copilot review could not run\n\n${hint}\n\n<sub>${reviewCost}</sub>`);
+  } catch (postError) {
+    console.error("Could not post the error to the PR:", postError);
+  }
+  process.exit(1);
 });

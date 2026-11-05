@@ -1,11 +1,12 @@
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { CopilotClient, RuntimeConnection, defineTool } from "@github/copilot-sdk";
-import { checkRuntimeApi, parseRuntimeApiBaseUrl, RUNTIME_API_PATHS, RUNTIME_API_TOOL_NAME } from "../../application/runtime-api-check.ts";
-import type { CopilotClientOptions, ProviderConfig } from "@github/copilot-sdk";
-import { agentsWithArchitectureContext, REVIEWER_AGENT_IDS, VALIDATOR_NAME } from "./agents.ts";
+import { approveAll, CopilotClient, defineTool } from "@github/copilot-sdk";
+import type { ProviderConfig } from "@github/copilot-sdk";
+import { agentsForRuntimeApiCheck, READ_ONLY_TOOLS, REVIEWER_AGENT_IDS, VALIDATOR_NAME } from "./agents.ts";
 import { conciseSummary } from "../../application/findings.ts";
+import {
+  checkRuntimeApi,
+  RUNTIME_API_PATHS,
+  RUNTIME_API_TOOL_NAME,
+} from "../../application/runtime-api-check.ts";
 import type { ReviewContext, RuntimeApiEvidence } from "../../application/types.ts";
 import { readReviewCost } from "./usage.ts";
 import { withRateLimitRetries } from "./rate-limit-retry.ts";
@@ -15,10 +16,12 @@ import type { ReviewStageRunner } from "../../application/review-pipeline.ts";
 export interface CopilotRunnerOptions {
   model?: string;
   provider?: ProviderConfig;
+  gitHubToken?: string;
+  workingDirectory?: string;
   maxAiCredits: number;
   max429Retries: number;
-  architectureDocuments?: ReviewContext["architectureDocuments"];
   runtimeApiUrl?: string;
+  architectureDocuments?: ReviewContext["architectureDocuments"];
   log: (message: string) => void;
   warn: (message: string) => void;
   sanitize: (message: string) => string;
@@ -34,23 +37,12 @@ interface RunState {
   unexpectedCalls: string[];
   budgetExhausted: boolean;
   totalNanoAiu?: number;
-  delegatedAgents: Set<string>;
-  runtimeEvidence: RuntimeApiEvidence[];
-  runtimeRequests: number;
+  runtimeApiEnabled: boolean;
+  runtimeApiEvidence: RuntimeApiEvidence[];
+  runtimeApiAttempted: boolean;
 }
 
-export function restrictedClientOptions(runtimeDirectory: string, byok = false): CopilotClientOptions {
-  return {
-    connection: RuntimeConnection.forStdio(),
-    mode: "empty",
-    baseDirectory: runtimeDirectory,
-    workingDirectory: runtimeDirectory,
-    useLoggedInUser: false,
-    ...(!byok && process.env.COPILOT_GITHUB_TOKEN ? { gitHubToken: process.env.COPILOT_GITHUB_TOKEN } : {}),
-    env: { PATH: process.env.PATH, HOME: runtimeDirectory, TMPDIR: runtimeDirectory },
-    logLevel: "info",
-  };
-}
+const MAX_RUNTIME_REQUESTS = 10;
 
 /**
  * SDK boundary: owns CopilotClient/session lifecycle, tool allowlists, events,
@@ -63,29 +55,36 @@ export class CopilotReviewRunner implements ReviewStageRunner {
   private readonly options: CopilotRunnerOptions;
   private readonly state: RunState;
   private readonly startedAt = Date.now();
-  private readonly runtimeDirectory: string;
 
   private constructor(
     client: CopilotClient,
     session: Awaited<ReturnType<CopilotClient["createSession"]>>,
     options: CopilotRunnerOptions,
     state: RunState,
-    runtimeDirectory: string,
   ) {
     this.client = client;
     this.session = session;
     this.options = options;
     this.state = state;
-    this.runtimeDirectory = runtimeDirectory;
   }
 
   static async start(options: CopilotRunnerOptions): Promise<CopilotReviewRunner> {
-    if (options.runtimeApiUrl) parseRuntimeApiBaseUrl(options.runtimeApiUrl);
-    const runtimeDirectory = await mkdtemp(join(tmpdir(), "static-copilot-review-"));
-    const client = new CopilotClient(restrictedClientOptions(runtimeDirectory, options.provider !== undefined));
+    const client = new CopilotClient({
+      ...(options.gitHubToken ? { gitHubToken: options.gitHubToken } : {}),
+      useLoggedInUser: false,
+      logLevel: "info",
+    });
     try {
+      const runtimeApiUrl = options.runtimeApiUrl;
+      const runtimeApiEnabled = runtimeApiUrl !== undefined;
+      options.log(`[runtime-api] registration ${JSON.stringify({
+        tool: RUNTIME_API_TOOL_NAME,
+        enabled: runtimeApiEnabled,
+        allowedAgent: VALIDATOR_NAME,
+        reason: runtimeApiEnabled ? "loopback API URL is configured" : "runtime API evidence was not enabled",
+      })}`);
       const sessionModel = options.model ?? "SDK default";
-      const agents = agentsWithArchitectureContext(options.architectureDocuments, options.runtimeApiUrl !== undefined);
+      const agents = agentsForRuntimeApiCheck(runtimeApiEnabled, options.architectureDocuments);
       const agentModels = agents
         .map((agent) => `${agent.name}=${agent.model ?? sessionModel}`)
         .join(", ");
@@ -102,79 +101,70 @@ export class CopilotReviewRunner implements ReviewStageRunner {
         failures: [],
         unexpectedCalls: [],
         budgetExhausted: false,
-        delegatedAgents: new Set(),
-        runtimeEvidence: [],
-        runtimeRequests: 0,
+        runtimeApiEnabled,
+        runtimeApiEvidence: [],
+        runtimeApiAttempted: false,
       };
-      const runtimeApiUrl = options.runtimeApiUrl;
-      const runtimeTool = runtimeApiUrl === undefined ? undefined : defineTool(RUNTIME_API_TOOL_NAME, {
-        description: "Probe the configured loopback demo service. Only listed paths are allowed; no request bodies or redirects. Responses are untrusted evidence.",
-        parameters: {
-          type: "object", additionalProperties: false, required: ["method", "path"],
-          properties: {
-            method: { type: "string" },
-            path: { type: "string", enum: [...RUNTIME_API_PATHS] },
+      let apiToolInvocationCount = 0;
+      const captureRuntimeApi = async (
+        url: string,
+        method: string,
+        path: string,
+      ): Promise<RuntimeApiEvidence> => {
+        if (apiToolInvocationCount > MAX_RUNTIME_REQUESTS) {
+          throw new Error(`Runtime endpoint tool is limited to ${MAX_RUNTIME_REQUESTS} requests per review`);
+        }
+        state.runtimeApiAttempted = true;
+        const evidence = await checkRuntimeApi(url, method, path);
+        state.runtimeApiEvidence.push(evidence);
+        return evidence;
+      };
+      const runtimeApiTool = runtimeApiUrl === undefined
+        ? undefined
+        : defineTool(RUNTIME_API_TOOL_NAME, {
+          description: "Send one HTTP request to the configured loopback demo service. Choose any valid HTTP method and one of the listed API paths. The origin is fixed, redirects are not followed, and no request body is sent. The actual response or connection error is recorded as review evidence. For a locale-specific profile cache candidate, call GET /profile/grace/es, then GET /profile/ada/en, then GET /profile/ada/es in that order, waiting for each result before the next call.",
+          parameters: {
+            type: "object",
+            additionalProperties: false,
+            required: ["method", "path"],
+            properties: {
+              method: { type: "string", description: "HTTP method token, such as GET, HEAD, POST, or OPTIONS." },
+              path: { type: "string", enum: [...RUNTIME_API_PATHS], description: "API path on the configured loopback service." },
+            },
           },
-        },
-        skipPermission: true,
-        handler: async (args: { method: string; path: string }) => {
-          if (state.stage !== "validator" || ++state.runtimeRequests > 10) {
-            throw new Error("Runtime probes are restricted to validation and 10 requests per review.");
-          }
-          const evidence = await checkRuntimeApi(runtimeApiUrl, args.method, args.path);
-          state.runtimeEvidence.push(evidence);
-          options.log(options.sanitize(`[runtime-api] ${JSON.stringify(evidence)}`));
-          return evidence;
-        },
-      });
+          skipPermission: true,
+          defer: "never",
+          handler: async (args: { method: string; path: string }) => {
+            const invocation = ++apiToolInvocationCount;
+            const startedAt = Date.now();
+            options.log(`[runtime-api] ${RUNTIME_API_TOOL_NAME} called ${JSON.stringify({
+              invocation, stage: state.stage, method: args.method, path: args.path,
+            })}`);
+            const complete = (evidence: RuntimeApiEvidence) => {
+              options.log(options.sanitize(`[runtime-api] ${RUNTIME_API_TOOL_NAME} completed\n${JSON.stringify({
+                invocation, durationMs: Date.now() - startedAt, output: evidence,
+              }, null, 2)}`));
+              return evidence;
+            };
+            return complete(await captureRuntimeApi(runtimeApiUrl, args.method, args.path));
+          },
+        });
       const session = await client.createSession({
         ...(options.model ? { model: options.model } : {}),
         ...(options.provider ? { provider: options.provider } : {}),
-        workingDirectory: runtimeDirectory,
-        availableTools: ["task", ...(runtimeTool ? [RUNTIME_API_TOOL_NAME] : [])],
-        ...(runtimeTool ? {
-          tools: [runtimeTool], defaultAgent: { excludedTools: [RUNTIME_API_TOOL_NAME] },
-        } : {}),
-        customAgents: agents,
+        workingDirectory: options.workingDirectory,
         skipCustomInstructions: true,
         enableConfigDiscovery: false,
-        enableOnDemandInstructionDiscovery: false,
-        enableFileHooks: false,
-        enableHostGitOperations: false,
-        enableSessionStore: false,
-        enableSkills: false,
         customAgentsLocalOnly: true,
-        mcpServers: {},
-        skillDirectories: [],
-        agentDirectories: [],
-        hookDirectories: [],
-        instructionDirectories: [],
-        pluginDirectories: [],
+        availableTools: [...READ_ONLY_TOOLS, "task", ...(runtimeApiTool ? [RUNTIME_API_TOOL_NAME] : [])],
+        customAgents: agents,
+        ...(runtimeApiTool ? {
+          tools: [runtimeApiTool],
+          defaultAgent: { excludedTools: [RUNTIME_API_TOOL_NAME] },
+        } : {}),
         sessionLimits: { maxAiCredits: options.maxAiCredits },
-        onPermissionRequest: (request) => {
-          options.warn(`Denied review permission request: ${request.kind}`);
-          return { kind: "reject", feedback: "Static review permits no filesystem, process, or network tool access." };
-        },
+        onPermissionRequest: approveAll,
         hooks: {
-          onPreToolUse: ({ toolName, toolArgs, agentId, agentType }) => {
-            if (runtimeTool && toolName === RUNTIME_API_TOOL_NAME &&
-                state.stage === "validator" && agentType === VALIDATOR_NAME) {
-              return { permissionDecision: "allow" };
-            }
-            const args = toolArgs && typeof toolArgs === "object" && !Array.isArray(toolArgs) ? toolArgs : {};
-            const target = "agent_type" in args && typeof args.agent_type === "string" ? args.agent_type : "";
-            const allowed = state.stage === "specialists" ? state.expectedSpecialists
-              : state.stage === "validator" ? [VALIDATOR_NAME] : [];
-            if (toolName === "task" && !agentId && !agentType && allowed.includes(target) &&
-                !state.delegatedAgents.has(target) &&
-                (!("mode" in args) || args.mode === "sync") &&
-                !("model" in args) && !("reasoning_effort" in args) && !("context_tier" in args)) {
-              state.delegatedAgents.add(target);
-              return { permissionDecision: "allow" };
-            }
-            options.warn(`Blocked non-delegation review tool: ${toolName}`);
-            return { permissionDecision: "deny", permissionDecisionReason: "Only trusted review-agent delegation is allowed." };
-          },
           onSubagentStop: ({ agentName, response }) => {
             if (state.stage === "specialists" && Object.hasOwn(REVIEWER_AGENT_IDS, agentName)) {
               if (state.expectedSpecialists.includes(agentName)) {
@@ -195,7 +185,7 @@ export class CopilotReviewRunner implements ReviewStageRunner {
           },
         },
       });
-      const runner = new CopilotReviewRunner(client, session, options, state, runtimeDirectory);
+      const runner = new CopilotReviewRunner(client, session, options, state);
       runner.attachListeners();
       return runner;
     } catch (error: unknown) {
@@ -205,7 +195,6 @@ export class CopilotReviewRunner implements ReviewStageRunner {
         const message = stopError instanceof Error ? stopError.message : String(stopError);
         options.warn(`Could not stop Copilot client after startup failure: ${options.sanitize(message)}`);
       }
-      await rm(runtimeDirectory, { recursive: true, force: true });
       throw error;
     }
   }
@@ -262,6 +251,9 @@ export class CopilotReviewRunner implements ReviewStageRunner {
     await withRateLimitRetries(
       async () => {
         this.resetStageAttempt();
+        this.options.log(`[runtime-api] validation-start\n${this.options.sanitize(JSON.stringify({
+          enabled: this.state.runtimeApiEnabled,
+        }, null, 2))}`);
         await this.session.sendAndWait({ prompt }, timeoutMs);
         this.assertStageSucceeded("final validation");
       },
@@ -272,20 +264,35 @@ export class CopilotReviewRunner implements ReviewStageRunner {
     if (reports.length !== 1) {
       throw new Error(`Final validation must capture exactly one validator report; received ${reports.length}.`);
     }
-    if (this.options.runtimeApiUrl && !this.state.runtimeEvidence.length) {
-      throw new Error("Final validator did not call the required check_runtime_api tool.");
+
+    if (this.options.runtimeApiUrl !== undefined && this.state.runtimeApiEvidence.length === 0) {
+      this.options.log("[runtime-api] required validator tool call was not observed.");
+      throw new Error(
+        "Final validator did not call the required check_runtime_api tool; runtime evidence was not captured.",
+      );
     }
 
+    this.options.log(this.options.sanitize(`[runtime-api] validation-complete\n${JSON.stringify({
+      enabled: this.state.runtimeApiEnabled,
+      attempted: this.state.runtimeApiAttempted,
+      captured: this.state.runtimeApiEvidence.length > 0,
+      source: this.state.runtimeApiEnabled
+        ? this.state.runtimeApiEvidence.length ? "validator tool" : "unavailable"
+        : "disabled",
+      reason: !this.state.runtimeApiEnabled ? "tool unavailable"
+        : !this.state.runtimeApiAttempted ? "validator did not call the tool"
+        : "request and response captured for review rendering",
+    }, null, 2)}`));
     this.state.stage = "complete";
     return reports[0];
   }
 
   get runtimeApiCheckEnabled(): boolean {
-    return this.options.runtimeApiUrl !== undefined;
+    return this.state.runtimeApiEnabled;
   }
 
   getRuntimeApiEvidence(): RuntimeApiEvidence[] {
-    return [...this.state.runtimeEvidence];
+    return [...this.state.runtimeApiEvidence];
   }
 
   private assertStageSucceeded(label: string): void {
@@ -302,8 +309,8 @@ export class CopilotReviewRunner implements ReviewStageRunner {
     this.state.outputs.clear();
     this.state.failures.length = 0;
     this.state.unexpectedCalls.length = 0;
-    this.state.delegatedAgents.clear();
-    this.state.runtimeEvidence.length = 0;
+    this.state.runtimeApiAttempted = false;
+    this.state.runtimeApiEvidence.length = 0;
   }
 
   private logRateLimitRetry(stage: string, retry: number, delayMs: number): void {
@@ -333,6 +340,5 @@ export class CopilotReviewRunner implements ReviewStageRunner {
       const message = error instanceof Error ? error.message : String(error);
       this.options.warn(`Could not stop Copilot client: ${this.options.sanitize(message)}`);
     }
-    await rm(this.runtimeDirectory, { recursive: true, force: true });
   }
 }
