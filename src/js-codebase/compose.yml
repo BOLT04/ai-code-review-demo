@@ -1,0 +1,33 @@
+services:
+  api:
+    image: review-demo-api:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:3010:3010"
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,noexec,nosuid,size=8m"
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    pids_limit: 32
+    mem_limit: 64m
+    cpus: 0.5
+    init: true
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3010/health').then(r => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1))"
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "2"

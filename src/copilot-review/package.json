@@ -1,0 +1,27 @@
+{
+  "name": "copilot-review",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "review": "node src/review.ts",
+    "test": "node --test tests/*.test.ts",
+    "check:updates": "npm outdated",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@github/copilot-sdk": "^1.0.28",
+    "@octokit/rest": "^22.0.1"
+  },
+  "overrides": {
+    "@github/copilot-sdk": {
+      "zod": "4.6.6"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}

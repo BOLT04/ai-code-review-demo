@@ -29,17 +29,33 @@ Nowadays, we are creating more PRs per day and senior engineers are tasked with 
 
 GitHub Copilot's built-in code review already handles a lot of the noise, like style issues, missing tests, and common bugs. In this session, we'll do a live walkthrough of what it catches out of the box, and then build a custom code review agent using the Copilot SDK, showcasing how you can make a high-quality code review agent.
 
-### Slides
+#### Slides
 The slides for the talk are in [slides/genai-meetup-2026-practical-workflows-ai-code-review.pdf](slides/genai-meetup-2026-practical-workflows-ai-code-review.pdf). This was for the [GenAI Lisbon meetup 2026](https://www.meetup.com/lisbon-genai-community/events/315381061/).
 
-### Talk recording
+#### Talk recording
 
 - [GenAI Lisbon meetup 2026](https://www.youtube.com/watch?v=E3lXaXTMxpM)
 
-### Duration
+#### Duration
 25min - 45min
 
-### Target audience
+#### Target audience
+Developers, Architects
+
+### What Copilot code review catches (and how to build a custom agent for the rest)
+
+Teams are merging more pull requests per day, and senior engineers can't review them all. In this session, David Pereira does a live walkthrough of what Copilot code review handles out of the box, then builds a custom agent using the Copilot SDK with focused sub-agents for concerns like performance and architecture. You'll learn how to pair built-in review with custom agents that enforce your team's specific standards, along with practical patterns for building reliable agents with the SDK.
+
+#### Slides
+The slides for the talk are in [slides/TODO-yup](TODO). This was for the [GitHub Universe 2026 session](https://reg.githubuniverse.com/flow/github/universe26/attendee-portal/page/sessioncatalog/session/1777589183350001c9fe)
+
+#### Talk recording
+TODO later
+
+#### Duration
+15min
+
+#### Target audience
 Developers, Architects
 
 ## Cool AI code review resources
