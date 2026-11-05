@@ -156,7 +156,7 @@ export class CopilotReviewRunner implements ReviewStageRunner {
         skipCustomInstructions: true,
         enableConfigDiscovery: false,
         customAgentsLocalOnly: true,
-        availableTools: [...READ_ONLY_TOOLS, "task", ...(runtimeApiTool ? [RUNTIME_API_TOOL_NAME] : [])],
+        availableTools: [...READ_ONLY_TOOLS, ...(runtimeApiTool ? [RUNTIME_API_TOOL_NAME] : [])],
         customAgents: agents,
         ...(runtimeApiTool ? {
           tools: [runtimeApiTool],
