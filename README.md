@@ -14,6 +14,19 @@ AI adoption is on the rise throughout our SDLC, and so is the number of merged P
 
 Plus, I'll share the prompts and workflows that have been effective for me and my team, what works, and the challenges we overcame adopting AI for code reviews. If you are thinking about adopting AI for code reviews, this talk is for you!
 
+#### Slides
+The slides for the talk are in [slides/genai-meetup-2026-practical-workflows-ai-code-review.pdf](slides/genai-meetup-2026-practical-workflows-ai-code-review.pdf). This was for the [GenAI Lisbon meetup 2026](https://www.meetup.com/lisbon-genai-community/events/315381061/).
+
+#### Talk recording
+
+- [GenAI Lisbon meetup 2026](https://www.youtube.com/watch?v=E3lXaXTMxpM)
+
+#### Duration
+25min - 45min
+
+#### Target audience
+Developers, Architects
+
 ### Multi-agent AI systems that produce high-quality software
 
 Software quality is crucial for many teams. It defines the trust and expectation customers have in your product, but is often less important than pure speed in some organizations. So using AI to speed up code generation only leads to hundreds of PRs senior engineers must review. This is no longer enough to ensure high-quality software.
@@ -28,19 +41,6 @@ Key takeaways:
 Nowadays, we are creating more PRs per day and senior engineers are tasked with code review. Ensuring quality software gets merged is crucial to keeping our production software reliable.
 
 GitHub Copilot's built-in code review already handles a lot of the noise, like style issues, missing tests, and common bugs. In this session, we'll do a live walkthrough of what it catches out of the box, and then build a custom code review agent using the Copilot SDK, showcasing how you can make a high-quality code review agent.
-
-#### Slides
-The slides for the talk are in [slides/genai-meetup-2026-practical-workflows-ai-code-review.pdf](slides/genai-meetup-2026-practical-workflows-ai-code-review.pdf). This was for the [GenAI Lisbon meetup 2026](https://www.meetup.com/lisbon-genai-community/events/315381061/).
-
-#### Talk recording
-
-- [GenAI Lisbon meetup 2026](https://www.youtube.com/watch?v=E3lXaXTMxpM)
-
-#### Duration
-25min - 45min
-
-#### Target audience
-Developers, Architects
 
 ### What Copilot code review catches (and how to build a custom agent for the rest)
 
