@@ -47,7 +47,7 @@ GitHub Copilot's built-in code review already handles a lot of the noise, like s
 Teams are merging more pull requests per day, and senior engineers can't review them all. In this session, David Pereira does a live walkthrough of what Copilot code review handles out of the box, then builds a custom agent using the Copilot SDK with focused sub-agents for concerns like performance and architecture. You'll learn how to pair built-in review with custom agents that enforce your team's specific standards, along with practical patterns for building reliable agents with the SDK.
 
 #### Slides
-The slides for the talk are in [slides/TODO-yup](TODO). This was for the [GitHub Universe 2026 session](https://reg.githubuniverse.com/flow/github/universe26/attendee-portal/page/sessioncatalog/session/1777589183350001c9fe)
+The slides for the talk are in [slides/github-universe-2026-BLD1454D-What-Copilot-code-review-catches-and-how-to-build-a-custom-agent-for-the-rest-presentation.pdf](slides/github-universe-2026-BLD1454D-What-Copilot-code-review-catches-and-how-to-build-a-custom-agent-for-the-rest-presentation.pdf). This was for the [GitHub Universe 2026 session](https://reg.githubuniverse.com/flow/github/universe26/attendee-portal/page/sessioncatalog/session/1777589183350001c9fe)
 
 #### Talk recording
 TODO later
